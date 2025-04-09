@@ -24,7 +24,7 @@ class DiscordScraper:
         }
         self.session = None
         self.db = Database("discord.db")
-        self.request_limiter = AsyncLimiter(3, 1)
+        self.request_limiter = AsyncLimiter(5, 2)
 
     async def async_init(self):
         self.session = ClientSession()
@@ -44,15 +44,18 @@ class DiscordScraper:
                 else:
                     raise Exception(f"Failed to fetch guilds: {response.status}")
 
-    async def get_guild_channels(self) -> None:
-        guilds = await self.db.get_guilds()
+    async def get_guild_channels(self, guild_id: str = None, guild_name: str = None) -> None:
+        if guild_id:
+            guilds = [(guild_id, f"Retrying {guild_name}")]
+        else:
+            guilds = await self.db.get_guilds()
         for guild in guilds:
             guild_id = guild[0]
             guild_name = guild[1]
             print("Getting channels for guild:", guild_id, guild_name)
             api_endpoint = self.main_url / "v9" / "guilds" / guild_id / "channels"
 
-            async with AsyncLimiter(1, 3):
+            async with AsyncLimiter(10):
                 async with self.session.get(api_endpoint, headers=self.headers) as response:
                     if response.status == 200:
                         channels = await response.json()
@@ -66,17 +69,18 @@ class DiscordScraper:
                         if response.status == 429:
                             print("Rate limited, retrying in 5s...")
                             await asyncio.sleep(5)
-                            await self.get_guild_channels(guild_id)
+                            await self.get_guild_channels(guild_id, guild_name)
                         else:
                             raise Exception(f"Failed to fetch channels for guild {guild_id}: {response.status}")
 
     async def search_guild_media(self, guild, timestamp: str = None) -> AsyncGenerator[dict, None]:
         print("Searching media in guild:", guild)
         request_json = {
+            "include_nsfw": True,
             "tabs": {
                 "media": {
                     "sort_by": "timestamp",
-                    "sort_order": "desc",
+                    "sort_order": "asc",
                     "has": ["image", "video"],
                     "cursor": {
                         "timestamp": timestamp,
@@ -121,10 +125,11 @@ class DiscordScraper:
 
     async def search_direct_message_media(self) -> AsyncGenerator[dict, None]:
         request_json = {
+            "include_nsfw": True,
             "tabs": {
                 "media": {
                     "sort_by": "timestamp",
-                    "sort_order": "desc",
+                    "sort_order": "asc",
                     "has": ["image", "video"],
                     "limit": 25,
                 }
@@ -157,65 +162,15 @@ class DiscordScraper:
                             "type": "timestamp"
                         }
 
-    async def get_channel_media(self, guild_id: str, channel_id: str, timestamp: str = None) -> AsyncGenerator[dict, None]:
-        print("Searching media in channel:", channel_id)
-        request_json = {
-            "channel_ids": [channel_id],
-            "sort_by": "timestamp",
-            "sort_order": "desc",
-            "has": ["image", "video"],
-            "limit": 25,
-            "cursor": {
-                "timestamp": timestamp,
-                "type": "timestamp"
-            } if timestamp else None
-        }
-
-        request_url = self.main_url / "v9" / "guilds" / guild_id / "messages/search/tabs"
-
-        while True:
-            async with self.request_limiter:
-                async with self.session.post(request_url, headers=self.headers, json=request_json) as response:
-                    data = await response.json()
-                    if "rate limited" in data.get("message", ""):
-                        sleep_time = data.get("retry_after", 0)
-                        await asyncio.sleep(sleep_time * 1.2)
-                        continue
-                    media = data.get("tabs", {}).get("media", {})
-                    messages = media.get("messages", [])
-                    if messages:
-                        timestamp = data.get("cursor", {}).get("timestamp")
-                        yield messages, timestamp
-                    else:
-                        print("No more messages found.")
-                        break
-
-                    if timestamp:
-                        request_json["cursor"] = {
-                            "timestamp": timestamp,
-                            "type": "timestamp"
-                        }
-
-
     async def process_guild_messages(self):
         guilds = await self.db.get_guilds()
         for guild in guilds:
             guild_id = guild[0]
-            async for messages, search_timestamp in self.search_guild_media(guild_id):
+            last_timestamp = guild[2] or None
+            async for messages, search_timestamp in self.search_guild_media(guild_id, last_timestamp):
                 for message in messages:
                     message = message[0]
                     await self.process_message(message, guild_id, search_timestamp)
-
-    async def process_nsfw_messages(self):
-        # Get NSFW channels and process messages
-        channels = await self.db.get_channels(is_nsfw=True)
-        for channel in channels:
-            channel_id = channel[0]
-            guild_id = channel[4]
-            async for messages, search_timestamp in self.get_channel_media(guild_id, channel_id):
-                for message in messages:
-                    message = message[0]
-                    await self.process_message(message, channel_id, search_timestamp)
 
     async def process_message(self, message, guild_id: str, search_timestamp: str):
         for attachment in message.get("attachments", []):
@@ -247,6 +202,7 @@ class DiscordScraper:
                     search_timestamp=search_timestamp
                 )
                 await self.db.insert_user(user_id, username)
+                await self.db.update_guild_timestamp(guild_id, search_timestamp)
 
     async def close(self):
         if self.session:
@@ -283,7 +239,8 @@ class Database:
         await self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS guilds (
                 id TEXT PRIMARY KEY,
-                name TEXT
+                name TEXT,
+                last_timestamp TEXT
             )
         """)
 
@@ -365,6 +322,10 @@ class Database:
                 channel_id, account_id, timestamp, search_timestamp))
         await self.connection.commit()
 
+    async def update_guild_timestamp(self, guild_id: str, timestamp: str):
+        await self.cursor.execute("UPDATE guilds SET last_timestamp = ? WHERE id = ?", (timestamp, guild_id))
+        await self.connection.commit()
+
     async def get_guilds(self):
         await self.cursor.execute("SELECT * FROM guilds")
         return await self.cursor.fetchall()
@@ -395,8 +356,7 @@ async def main():
     print("Getting Guild Channels...")
     await scraper.get_guild_channels()
     print("Processing Messages...")
-    await scraper.process_nsfw_messages()
-    # await scraper.process_guild_messages()
+    await scraper.process_guild_messages()
 
     await scraper.close()
     await db.close()
