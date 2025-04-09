@@ -13,37 +13,65 @@ if TYPE_CHECKING:
 
 
 class DiscordScraper:
-    def __init__(self, token):
+    def __init__(self, token, user_id: str = None, username: str = None):
         self.token = token
+        self.user_id = user_id
+        self.username = username
         self.main_url = URL("https://discord.com/api")
         self.headers = {
             "Authorization": token,
             "Content-Type": "application/json"
         }
-        self.guilds = []
-        self.guilds_media = []
-        self.guilds_media_urls = []
         self.session = None
         self.db = Database("discord.db")
-        self.request_limiter = AsyncLimiter(1, 10)
+        self.request_limiter = AsyncLimiter(3, 1)
 
     async def async_init(self):
         self.session = ClientSession()
         await self.db.async_init()
+        await self.db.insert_scraping_account(self.user_id, self.username)
 
-    async def get_guilds(self) -> list[int]:
+    async def get_guilds(self) -> None:
         api_endpoint = self.main_url / "v9/users" / "@me" / "guilds"
 
-        async with self.session.get(api_endpoint, headers=self.headers) as response:
-            if response.status == 200:
-                guilds = await response.json()
-                guilds = [guild["id"] for guild in guilds]
-                for guild in guilds:
-                    await self.db.insert_guild(guild, guild["name"])
-            else:
-                raise Exception(f"Failed to fetch guilds: {response.status}")
+        async with self.request_limiter:
+            async with self.session.get(api_endpoint, headers=self.headers) as response:
+                if response.status == 200:
+                    guilds = await response.json()
+                    for guild in guilds:
+                        await self.db.insert_guild(guild.get("id"), guild.get("name"))
+                        print("Inserted guild:", guild.get("id"), guild.get("name"))
+                else:
+                    raise Exception(f"Failed to fetch guilds: {response.status}")
+
+    async def get_guild_channels(self) -> None:
+        guilds = await self.db.get_guilds()
+        for guild in guilds:
+            guild_id = guild[0]
+            guild_name = guild[1]
+            print("Getting channels for guild:", guild_id, guild_name)
+            api_endpoint = self.main_url / "v9" / "guilds" / guild_id / "channels"
+
+            async with AsyncLimiter(1, 3):
+                async with self.session.get(api_endpoint, headers=self.headers) as response:
+                    if response.status == 200:
+                        channels = await response.json()
+                        for channel in channels:
+                            if channel.get("type", -1) == 0: # Text channel
+                                channel_id = channel.get("id", 0)
+                                channel_name = channel.get("name", "")
+                                is_nsfw = channel.get("nsfw", False)
+                                await self.db.insert_channel(channel_id, channel_name, guild_id, is_nsfw, False)
+                    else:
+                        if response.status == 429:
+                            print("Rate limited, retrying in 5s...")
+                            await asyncio.sleep(5)
+                            await self.get_guild_channels(guild_id)
+                        else:
+                            raise Exception(f"Failed to fetch channels for guild {guild_id}: {response.status}")
 
     async def search_guild_media(self, guild, timestamp: str = None) -> AsyncGenerator[dict, None]:
+        print("Searching media in guild:", guild)
         request_json = {
             "tabs": {
                 "media": {
@@ -62,23 +90,34 @@ class DiscordScraper:
 
         request_url = self.main_url / "v9/guilds" / guild / "messages/search/tabs"
 
+        cnt = 0
         while True:
-            async with self.session.post(request_url, headers=self.headers, json=request_json) as response:
-                data = await response.json()
-                media = data.get("tabs", {}).get("media", {})
-                messages = media.get("messages", [])
+            async with self.request_limiter:
+                async with self.session.post(request_url, headers=self.headers, json=request_json) as response:
+                    data = await response.json()
+                    if "rate limited" in data.get("message", ""):
+                        sleep_time = data.get("retry_after", 0)
+                        await asyncio.sleep(sleep_time * 1.2)
+                        continue
+                    media = data.get("tabs", {}).get("media", {})
+                    messages = media.get("messages", [])
+                    # Save response json to folder
+                    with open(f"resps/response{cnt}.json", "w") as f:
+                        json.dump(data, f, indent=4)
+                    cnt += 1
 
-                if messages:
-                    yield messages
-                else:
-                    break
+                    if messages:
+                        timestamp = media.get("cursor", {}).get("timestamp")
+                        yield messages, timestamp
+                    else:
+                        print("No more messages found.")
+                        break
 
-                timestamp = media.get("cursor", {}).get("timestamp")
-                if timestamp:
-                    request_json["tabs"]["media"]["cursor"] = {
-                        "timestamp": timestamp,
-                        "type": "timestamp"
-                    }
+                    if timestamp:
+                        request_json["tabs"]["media"]["cursor"] = {
+                            "timestamp": timestamp,
+                            "type": "timestamp"
+                        }
 
     async def search_direct_message_media(self) -> AsyncGenerator[dict, None]:
         request_json = {
@@ -96,24 +135,118 @@ class DiscordScraper:
         request_url = self.main_url / "v9/users" / "@me" / "messages/search/tabs"
 
         while True:
-            async with self.session.post(request_url, headers=self.headers, json=request_json) as response:
-                data = await response.json()
-                media = data.get("tabs", {}).get("media", {})
-                messages = media.get("messages", [])
+            async with self.request_limiter:
+                async with self.session.post(request_url, headers=self.headers, json=request_json) as response:
+                    data = await response.json()
+                    if "rate limited" in data.get("message", ""):
+                        sleep_time = data.get("retry_after", 0)
+                        await asyncio.sleep(sleep_time * 1.2)
+                        continue
+                    media = data.get("tabs", {}).get("media", {})
+                    messages = media.get("messages", [])
 
-                if messages:
-                    yield messages
-                else:
-                    break
+                    if messages:
+                        timestamp = media.get("cursor", {}).get("timestamp")
+                        yield messages, timestamp
+                    else:
+                        break
 
-    async def process_messages(self, guild):
-        async for messages in self.search_media(guild):
-            for message in messages:
-                for attachment in message.get("attachments", []):
-                    url = attachment.get("url")
-                    if url and url not in self.guilds_media_urls:
-                        self.guilds_media_urls.append(url)
-                        self.guilds_media.append(attachment)
+                    if timestamp:
+                        request_json["cursor"] = {
+                            "timestamp": timestamp,
+                            "type": "timestamp"
+                        }
+
+    async def get_channel_media(self, guild_id: str, channel_id: str, timestamp: str = None) -> AsyncGenerator[dict, None]:
+        print("Searching media in channel:", channel_id)
+        request_json = {
+            "channel_ids": [channel_id],
+            "sort_by": "timestamp",
+            "sort_order": "desc",
+            "has": ["image", "video"],
+            "limit": 25,
+            "cursor": {
+                "timestamp": timestamp,
+                "type": "timestamp"
+            } if timestamp else None
+        }
+
+        request_url = self.main_url / "v9" / "guilds" / guild_id / "messages/search/tabs"
+
+        while True:
+            async with self.request_limiter:
+                async with self.session.post(request_url, headers=self.headers, json=request_json) as response:
+                    data = await response.json()
+                    if "rate limited" in data.get("message", ""):
+                        sleep_time = data.get("retry_after", 0)
+                        await asyncio.sleep(sleep_time * 1.2)
+                        continue
+                    media = data.get("tabs", {}).get("media", {})
+                    messages = media.get("messages", [])
+                    if messages:
+                        timestamp = data.get("cursor", {}).get("timestamp")
+                        yield messages, timestamp
+                    else:
+                        print("No more messages found.")
+                        break
+
+                    if timestamp:
+                        request_json["cursor"] = {
+                            "timestamp": timestamp,
+                            "type": "timestamp"
+                        }
+
+
+    async def process_guild_messages(self):
+        guilds = await self.db.get_guilds()
+        for guild in guilds:
+            guild_id = guild[0]
+            async for messages, search_timestamp in self.search_guild_media(guild_id):
+                for message in messages:
+                    message = message[0]
+                    await self.process_message(message, guild_id, search_timestamp)
+
+    async def process_nsfw_messages(self):
+        # Get NSFW channels and process messages
+        channels = await self.db.get_channels(is_nsfw=True)
+        for channel in channels:
+            channel_id = channel[0]
+            guild_id = channel[4]
+            async for messages, search_timestamp in self.get_channel_media(guild_id, channel_id):
+                for message in messages:
+                    message = message[0]
+                    await self.process_message(message, channel_id, search_timestamp)
+
+    async def process_message(self, message, guild_id: str, search_timestamp: str):
+        for attachment in message.get("attachments", []):
+            file_id = attachment.get("id", 0)
+            url = attachment.get("url")
+            filename = attachment.get("filename")
+            size = attachment.get("size", 0)
+            content_type = attachment.get("content_type")
+            width = attachment.get("width", 0)
+            height = attachment.get("height", 0)
+            user_id = message.get("author", {}).get("id")
+            username = message.get("author", {}).get("username")
+            channel_id = message.get("channel_id")
+            timestamp = message.get("timestamp")
+            if url:
+                await self.db.insert_media(
+                    file_id=file_id,
+                    url=url,
+                    filename=filename,
+                    size=size,
+                    content_type=content_type,
+                    width=width,
+                    height=height,
+                    user_id=user_id,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    account_id=self.user_id,
+                    timestamp=timestamp,
+                    search_timestamp=search_timestamp
+                )
+                await self.db.insert_user(user_id, username)
 
     async def close(self):
         if self.session:
@@ -133,85 +266,115 @@ class Database:
 
     async def create_tables(self):
         await self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS guilds (
-                id INTEGER PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS accounts (
+                id TEXT PRIMARY KEY,
                 name TEXT
             )
         """)
+
         await self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                channel_id TEXT
+            )
+        """)
+
+        await self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS guilds (
+                id TEXT PRIMARY KEY,
                 name TEXT
             )
         """)
+
         await self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS channels (
-                id INTEGER PRIMARY KEY,
+                id TEXT PRIMARY KEY,
                 name TEXT,
-                guild_id INTEGER,
+                is_dm INTEGER,
+                is_nsfw INTEGER,
+                guild_id TEXT,
                 FOREIGN KEY (guild_id) REFERENCES guilds(id)
             )
         """)
+
         await self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS media (
-                file_id INTEGER PRIMARY KEY,
+                file_id TEXT PRIMARY KEY,
                 url TEXT,
                 filename TEXT,
                 size INTEGER,
                 content_type TEXT,
                 width INTEGER,
                 height INTEGER,
-                user_id INTEGER,
-                guild_id INTEGER,
-                channel_id INTEGER,
-                account_id INTEGER,
-                timestamp INTEGER,
+                user_id TEXT,
+                guild_id TEXT,
+                channel_id TEXT,
+                account_id TEXT,
+                timestamp TEXT,
+                search_timestamp TEXT,
                 FOREIGN KEY (user_id) REFERENCES users(id),
                 FOREIGN KEY (guild_id) REFERENCES guilds(id),
                 FOREIGN KEY (channel_id) REFERENCES channels(id),
-                FOREIGN KEY (account_id) REFERENCES main_users(id)
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
             )
         """)
-        await self.cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS main_users (
-                id INTEGER PRIMARY KEY,
-                name TEXT,
-                FOREIGN KEY (id) REFERENCES users(id)
-            )
-            """)
+
         await self.connection.commit()
 
-    async def insert_guild(self, guild_id, name):
+    async def insert_guild(self, guild_id: str, name: str):
         await self.cursor.execute("INSERT OR IGNORE INTO guilds (id, name) VALUES (?, ?)", (guild_id, name))
         await self.connection.commit()
         await self.cursor.execute("UPDATE guilds SET name = ? WHERE id = ?", (name, guild_id))
         await self.connection.commit()
 
-    async def insert_user(self, user_id, name):
-        await self.cursor.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)", (user_id, name))
+    async def insert_user(self, user_id: str, name: str, channel_id: str = None):
+        await self.cursor.execute("INSERT OR IGNORE INTO users (id, name, channel_id) VALUES (?, ?, ?)",
+                                (user_id, name, channel_id))
         await self.connection.commit()
-        await self.cursor.execute("UPDATE users SET name = ? WHERE id = ?", (name, user_id))
-        await self.connection.commit()
-
-    async def insert_channel(self, channel_id, name, guild_id):
-        await self.cursor.execute("INSERT OR IGNORE INTO channels (id, name, guild_id) VALUES (?, ?, ?)",
-                                (channel_id, name, guild_id))
-        await self.connection.commit()
-        await self.cursor.execute("UPDATE channels SET name = ? WHERE id = ?", (name, channel_id))
+        await self.cursor.execute("UPDATE users SET name = ?, channel_id = ? WHERE id = ?", (name, channel_id, user_id))
         await self.connection.commit()
 
-    async def insert_main_user(self, user_id, username):
-        await self.cursor.execute("INSERT OR IGNORE INTO main_users (id, name) VALUES (?, ?)", (user_id, username))
+    async def insert_channel(self, channel_id: str, name: str, guild_id: str, is_nsfw: bool = False, is_dm: bool = False):
+        await self.cursor.execute("INSERT OR IGNORE INTO channels (id, name, is_dm, is_nsfw, guild_id) VALUES (?, ?, ?, ?, ?)",
+                                (channel_id, name, is_dm, is_nsfw, guild_id))
         await self.connection.commit()
-        await self.cursor.execute("UPDATE main_users SET name = ? WHERE id = ?", (username, user_id))
+        await self.cursor.execute("UPDATE channels SET name = ?, is_nsfw = ? WHERE id = ?", (name, is_nsfw, channel_id))
         await self.connection.commit()
 
-    async def insert_user(self, user_id, username):
-        await self.cursor.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)", (user_id, username))
+    async def insert_scraping_account(self, user_id: str, username: str):
+        await self.cursor.execute("INSERT OR IGNORE INTO accounts (id, name) VALUES (?, ?)", (user_id, username))
         await self.connection.commit()
-        await self.cursor.execute("UPDATE users SET name = ? WHERE id = ?", (username, user_id))
+        await self.cursor.execute("UPDATE accounts SET name = ? WHERE id = ?", (username, user_id))
         await self.connection.commit()
+
+    async def insert_user(self, user_id: str, username: str, channel_id: str = None):
+        await self.cursor.execute("INSERT OR IGNORE INTO users (id, name, channel_id) VALUES (?, ?, ?)",
+                                (user_id, username, channel_id))
+        await self.connection.commit()
+        await self.cursor.execute("UPDATE users SET name = ?, channel_id = ? WHERE id = ?", (username, channel_id, user_id))
+        await self.connection.commit()
+
+    async def insert_media(self, file_id: str, url: str, filename: str, size: int, content_type: str, width: int, height: int, user_id: str, guild_id: str,
+                        channel_id: str, account_id: str, timestamp: str, search_timestamp: str):
+        await self.cursor.execute("""
+            INSERT OR IGNORE INTO media (file_id, url, filename, size, content_type, width, height, user_id, guild_id,
+                                        channel_id, account_id, timestamp, search_timestamp)
+            VALUES (?,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (file_id, url, filename, size, content_type, width, height, user_id, guild_id,
+                channel_id, account_id, timestamp, search_timestamp))
+        await self.connection.commit()
+
+    async def get_guilds(self):
+        await self.cursor.execute("SELECT * FROM guilds")
+        return await self.cursor.fetchall()
+
+    async def get_channels(self, guild_id: str = None, is_nsfw: bool = False):
+        if guild_id:
+            await self.cursor.execute("SELECT * FROM channels WHERE guild_id = ? AND is_nsfw = ?", (guild_id, is_nsfw))
+        else:
+            await self.cursor.execute("SELECT * FROM channels WHERE is_nsfw = ?", (is_nsfw,))
+        return await self.cursor.fetchall()
 
     async def close(self):
         if self.connection:
@@ -223,13 +386,19 @@ async def main():
     db = Database("discord.db")
     await db.async_init()
 
-    # scraper = DiscordScraper("your_token_here")
-    # await scraper.async_init()
+    scraper = DiscordScraper("", "", "")
+    await scraper.async_init()
 
     # You can call scraper methods here, e.g.:
-    # await scraper.process_messages(guild_id)
+    print("Getting Guilds...")
+    await scraper.get_guilds()
+    print("Getting Guild Channels...")
+    await scraper.get_guild_channels()
+    print("Processing Messages...")
+    await scraper.process_nsfw_messages()
+    # await scraper.process_guild_messages()
 
-    # await scraper.close()
+    await scraper.close()
     await db.close()
 
 
