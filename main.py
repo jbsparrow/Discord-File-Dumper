@@ -1,5 +1,4 @@
 import json
-import aiohttp
 import asyncio
 from aiolimiter import AsyncLimiter
 from aiohttp import ClientSession
