@@ -17,14 +17,8 @@ logger = logging.getLogger(__name__)
 
 
 def log(message: str, level: int = logging.INFO):
-    if level == logging.INFO:
-        logger.info(message)
-    elif level == logging.ERROR:
-        logger.error(message)
-    elif level == logging.WARNING:
-        logger.warning(message)
-    elif level == logging.DEBUG:
-        logger.debug(message)
+    """Log a message with the specified logging level."""
+    logger.log(level, message)
 
 
 class DiscordScraper:
