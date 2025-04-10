@@ -1,7 +1,7 @@
 import argparse
-from argparse import BooleanOptionalAction
 import asyncio
 import logging
+from argparse import BooleanOptionalAction
 from collections.abc import AsyncGenerator
 from datetime import datetime
 
@@ -35,7 +35,7 @@ class Database:
             async for row in cursor:
                 yield row
 
-    async def get_media_by_user(
+    async def generate_media_query(
         self,
         user_id: str,
         guild_id: str | None = None,
@@ -43,7 +43,7 @@ class Database:
         content_type: str | None = None,
         is_dm: bool | None = None,
         is_nsfw: bool | None = None,
-    ) -> AsyncGenerator:
+    ):
         query = """
             SELECT media.* FROM media
             JOIN channels ON media.channel_id = channels.id
@@ -67,7 +67,15 @@ class Database:
             query += " AND channels.is_nsfw = ?"
             params.append(int(is_nsfw))
 
-        async with self.conn.execute(query, tuple(params)) as cursor:
+        return query, tuple(params)
+
+    async def check_user_has_media(self, query: str, params: tuple) -> bool:
+        async with self.conn.execute(query, params) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
+
+    async def get_media_by_user(self, query: str, params: tuple) -> AsyncGenerator:
+        async with self.conn.execute(query, params) as cursor:
             async for row in cursor:
                 yield row
 
@@ -96,12 +104,15 @@ class Dumper:
         async with aiofiles.open(self.output_file, "w") as f:
             async for user in self.db.get_users():
                 user_id = user[0]
-                username = user[1]
-                await f.write(f"=== {username} ({user_id})\n")
+                query = await self.db.generate_media_query(user_id=user_id, **self.filters)
+                has_media = await self.db.check_user_has_media(query[0], query[1])
+                if has_media:
+                    username = user[1]
+                    await f.write(f"=== {username} ({user_id})\n")
 
-                async for row in self.db.get_media_by_user(user_id=user_id, **self.filters):
-                    url = await self.check_cdn_expired(row[1])
-                    await f.write(f"{url}\n")
+                    async for row in self.db.get_media_by_user(query[0], query[1]):
+                        url = await self.check_cdn_expired(row[1])
+                        await f.write(f"{url}\n")
 
 
 def parse_args():
@@ -112,32 +123,28 @@ def parse_args():
     parser.add_argument("--guild-id", help="Filter by guild ID.")
     parser.add_argument("--channel-id", help="Filter by channel ID.")
     parser.add_argument("--content-type", help="Filter by content type (e.g., image/png).")
-    parser.add_argument("--fix-cdn", action=BooleanOptionalAction, default=True, help="Fix expired CDN URLs. (default: True)")
-
-    dm_group = parser.add_mutually_exclusive_group()
-    dm_group.add_argument("--dm", dest="is_dm", action="store_const", const=True, help="Only include DMs.")
-    dm_group.add_argument("--no-dm", dest="is_dm", action="store_const", const=False, help="Exclude DMs.")
-
-    nsfw_group = parser.add_mutually_exclusive_group()
-    nsfw_group.add_argument(
-        "--nsfw", dest="is_nsfw", action="store_const", const=True, help="Only include NSFW content."
+    parser.add_argument(
+        "--fix-cdn", action=BooleanOptionalAction, default=True, help="Fix expired CDN URLs. (default: True)"
     )
-    nsfw_group.add_argument(
-        "--no-nsfw", dest="is_nsfw", action="store_const", const=False, help="Exclude NSFW content."
-    )
+
+    parser.add_argument("--dm", action=BooleanOptionalAction, default=None, help="Only include DMs.")
+    parser.add_argument("--nsfw", action=BooleanOptionalAction, default=None, help="Only include NSFW content.")
 
     return parser.parse_args()
 
 
 async def main():
     args = parse_args()
+    if args.dm and args.nsfw:
+        log("Cannot use --dm and --nsfw together.", logging.ERROR)
+        return
 
     filters = {
         "guild_id": args.guild_id,
         "channel_id": args.channel_id,
         "content_type": args.content_type,
-        "is_dm": args.is_dm,
-        "is_nsfw": args.is_nsfw,
+        "is_dm": args.dm,
+        "is_nsfw": args.nsfw,
     }
 
     dumper = Dumper(args, **filters)
