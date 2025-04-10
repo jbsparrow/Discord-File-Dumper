@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import logging
 from collections.abc import AsyncGenerator
@@ -8,11 +9,13 @@ from aiohttp import ClientSession
 from aiolimiter import AsyncLimiter
 from yarl import URL
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S"
-)
+# Argparse setup
+parser = argparse.ArgumentParser(description="Discord Media Scraper")
+parser.add_argument("--deep-scrape", action="store_true", help="Perform a deep scrape of all channels and messages")
+args = parser.parse_args()
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
 
 
@@ -168,7 +171,7 @@ class DiscordScraper:
         guilds = await self.db.get_guilds()
         for guild in guilds:
             guild_id = guild[0]
-            last_timestamp = guild[2] or None
+            last_timestamp = guild[2] if not args.deep_scrape else None
             async for messages, search_timestamp in self.search_guild_media(guild_id, last_timestamp):
                 for message in messages:
                     message = message[0]
@@ -176,7 +179,7 @@ class DiscordScraper:
 
     async def process_dms(self):
         guild = await self.db.get_guilds(get_dms=True)
-        last_timestamp = guild[2] or None
+        last_timestamp = guild[2] if not args.deep_scrape else None
         async for messages, search_timestamp in self.search_dm_media(last_timestamp):
             for message in messages:
                 message = message[0]
@@ -250,8 +253,7 @@ class Database:
         await self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
-                name TEXT,
-                channel_id TEXT
+                name TEXT
             )
         """)
 
@@ -299,18 +301,22 @@ class Database:
         await self.connection.commit()
 
     async def insert_guild(self, guild_id: str, name: str):
-        await self.cursor.execute("INSERT OR IGNORE INTO guilds (id, name) VALUES (?, ?)", (guild_id, name))
-        await self.connection.commit()
-        await self.cursor.execute("UPDATE guilds SET name = ? WHERE id = ?", (name, guild_id))
+        await self.cursor.execute(
+            """
+            INSERT OR IGNORE INTO guilds (id, name) VALUES (?, ?)
+            ON CONFLICT(id) DO UPDATE SET name = excluded.name
+            """,
+            (guild_id, name),
+        )
         await self.connection.commit()
 
     async def insert_user(self, user_id: str, username: str, channel_id: str | None):
         await self.cursor.execute(
-            "INSERT OR IGNORE INTO users (id, name, channel_id) VALUES (?, ?, ?)", (user_id, username, channel_id)
-        )
-        await self.connection.commit()
-        await self.cursor.execute(
-            "UPDATE users SET name = ?, channel_id = ? WHERE id = ?", (username, channel_id, user_id)
+            """
+            INSERT OR IGNORE INTO users (id, name) VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET name = excluded.name
+            """,
+            (user_id, username),
         )
         await self.connection.commit()
 
@@ -318,17 +324,22 @@ class Database:
         self, channel_id: str, name: str, guild_id: str, is_nsfw: bool = False, is_dm: bool = False
     ):
         await self.cursor.execute(
-            "INSERT OR IGNORE INTO channels (id, name, is_dm, is_nsfw, guild_id) VALUES (?, ?, ?, ?, ?)",
+            """
+            INSERT OR IGNORE INTO channels (id, name, is_dm, is_nsfw, guild_id) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET name = excluded.name, is_dm = excluded.is_dm, is_nsfw = excluded.is_nsfw
+            """,
             (channel_id, name, is_dm, is_nsfw, guild_id),
         )
         await self.connection.commit()
-        await self.cursor.execute("UPDATE channels SET name = ?, is_nsfw = ? WHERE id = ?", (name, is_nsfw, channel_id))
-        await self.connection.commit()
 
     async def insert_scraping_account(self, user_id: str, username: str):
-        await self.cursor.execute("INSERT OR IGNORE INTO accounts (id, name) VALUES (?, ?)", (user_id, username))
-        await self.connection.commit()
-        await self.cursor.execute("UPDATE accounts SET name = ? WHERE id = ?", (username, user_id))
+        await self.cursor.execute(
+            """
+            INSERT OR IGNORE INTO accounts (id, name) VALUES (?, ?)
+            ON CONFLICT(id) DO UPDATE SET name = excluded.name
+            """,
+            (user_id, username),
+        )
         await self.connection.commit()
 
     async def insert_media(
@@ -349,9 +360,10 @@ class Database:
     ):
         await self.cursor.execute(
             """
-            INSERT OR IGNORE INTO media (file_id, url, filename, size, content_type, width, height, user_id, guild_id,
+            INSERT INTO media (file_id, url, filename, size, content_type, width, height, user_id, guild_id,
                                         channel_id, account_id, timestamp, search_timestamp)
             VALUES (?,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET url=excluded.url
         """,
             (
                 file_id,

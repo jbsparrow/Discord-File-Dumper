@@ -2,9 +2,11 @@ import argparse
 import asyncio
 import logging
 from collections.abc import AsyncGenerator
+from datetime import datetime
 
 import aiofiles
 import aiosqlite
+from yarl import URL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -80,6 +82,13 @@ class Dumper:
         await self.dump()
         await self.db.close()
 
+    async def check_cdn_expired(self, url: URL | str) -> bool:
+        url = URL(url)
+        expiry = int(url.query.get("ex", 0), 16) * 1000
+        if expiry <= datetime.now().timestamp() * 1000:
+            return str(url.with_host("fixcdn.hyonsu.com"))
+        return str(url)
+
     async def dump(self):
         async with aiofiles.open(self.output_file, "w") as f:
             async for user in self.db.get_users():
@@ -88,7 +97,7 @@ class Dumper:
                 await f.write(f"=== {username} ({user_id})\n")
 
                 async for row in self.db.get_media_by_user(user_id=user_id, **self.filters):
-                    url = row[1]
+                    url = await self.check_cdn_expired(row[1])
                     await f.write(f"{url}\n")
 
 
