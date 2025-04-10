@@ -49,13 +49,13 @@ class DiscordScraper:
             guilds = [(guild_id, f"Retrying {guild_name}")]
         else:
             guilds = await self.db.get_guilds()
-        for guild in guilds:
-            guild_id = guild[0]
-            guild_name = guild[1]
-            print("Getting channels for guild:", guild_id, guild_name)
-            api_endpoint = self.main_url / "v9" / "guilds" / guild_id / "channels"
+        async with AsyncLimiter(10):
+            for guild in guilds:
+                guild_id = guild[0]
+                guild_name = guild[1]
+                print("Getting channels for guild:", guild_id, guild_name)
+                api_endpoint = self.main_url / "v9" / "guilds" / guild_id / "channels"
 
-            async with AsyncLimiter(10):
                 async with self.session.get(api_endpoint, headers=self.headers) as response:
                     if response.status == 200:
                         channels = await response.json()
@@ -70,6 +70,9 @@ class DiscordScraper:
                             print("Rate limited, retrying in 5s...")
                             await asyncio.sleep(5)
                             await self.get_guild_channels(guild_id, guild_name)
+                        elif response.status == 403:
+                            print("Forbidden access to guild:", guild_id, guild_name)
+                            await self.db.remove_guild(guild_id)
                         else:
                             raise Exception(f"Failed to fetch channels for guild {guild_id}: {response.status}")
 
@@ -163,45 +166,6 @@ class DiscordScraper:
                             "type": "timestamp"
                         }
 
-    async def search_direct_message_media(self) -> AsyncGenerator[dict, None]:
-        request_json = {
-            "include_nsfw": True,
-            "tabs": {
-                "media": {
-                    "sort_by": "timestamp",
-                    "sort_order": "asc",
-                    "has": ["image", "video"],
-                    "limit": 25,
-                }
-            },
-            "track_exact_total_hits": True,
-        }
-
-        request_url = self.main_url / "v9/users" / "@me" / "messages/search/tabs"
-
-        while True:
-            async with self.request_limiter:
-                async with self.session.post(request_url, headers=self.headers, json=request_json) as response:
-                    data = await response.json()
-                    if "rate limited" in data.get("message", ""):
-                        sleep_time = data.get("retry_after", 0)
-                        await asyncio.sleep(sleep_time * 1.2)
-                        continue
-                    media = data.get("tabs", {}).get("media", {})
-                    messages = media.get("messages", [])
-
-                    if messages:
-                        timestamp = media.get("cursor", {}).get("timestamp")
-                        yield messages, timestamp
-                    else:
-                        break
-
-                    if timestamp:
-                        request_json["cursor"] = {
-                            "timestamp": timestamp,
-                            "type": "timestamp"
-                        }
-
     async def process_guild_messages(self):
         guilds = await self.db.get_guilds()
         for guild in guilds:
@@ -211,6 +175,12 @@ class DiscordScraper:
                 for message in messages:
                     message = message[0]
                     await self.process_message(message, guild_id, search_timestamp)
+
+    async def process_dms(self):
+        async for messages, search_timestamp in self.search_dm_media():
+            for message in messages:
+                message = message[0]
+                await self.process_message(message, "@me", search_timestamp)
 
     async def process_message(self, message, guild_id: str, search_timestamp: str):
         for attachment in message.get("attachments", []):
@@ -243,6 +213,8 @@ class DiscordScraper:
                 )
                 await self.db.insert_user(user_id, username)
                 await self.db.update_guild_timestamp(guild_id, search_timestamp)
+                if guild_id == "@me":
+                    await self.db.insert_channel(channel_id, f"{username} DMs", guild_id, False, True)
 
     async def close(self):
         if self.session:
@@ -318,6 +290,8 @@ class Database:
         """)
 
         await self.connection.commit()
+        await self.insert_guild("@me", "DMs")
+        await self.connection.commit()
 
     async def insert_guild(self, guild_id: str, name: str):
         await self.cursor.execute("INSERT OR IGNORE INTO guilds (id, name) VALUES (?, ?)", (guild_id, name))
@@ -368,7 +342,8 @@ class Database:
 
     async def get_guilds(self):
         await self.cursor.execute("SELECT * FROM guilds")
-        return await self.cursor.fetchall()
+        guilds = await self.cursor.fetchall()
+        return [guild for guild in guilds if guild[0] != "@me"]
 
     async def get_channels(self, guild_id: str = None, is_nsfw: bool = False):
         if guild_id:
@@ -376,6 +351,10 @@ class Database:
         else:
             await self.cursor.execute("SELECT * FROM channels WHERE is_nsfw = ?", (is_nsfw,))
         return await self.cursor.fetchall()
+
+    async def remove_guild(self, guild_id: str):
+        await self.cursor.execute("DELETE FROM guilds WHERE id = ?", (guild_id,))
+        await self.connection.commit()
 
     async def close(self):
         if self.connection:
@@ -402,9 +381,14 @@ async def main():
     await scraper.get_guild_channels()
     print("Processing Messages...")
     await scraper.process_guild_messages()
+    print("Processing DMs...")
+    await scraper.process_dms()
+    print("Done!")
 
     await scraper.close()
     await db.close()
+
+    exit()
 
 
 if __name__ == "__main__":
