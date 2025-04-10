@@ -18,6 +18,7 @@ class DiscordScraper:
         self.user_id = user_id
         self.username = username
         self.main_url = URL("https://discord.com/api")
+        self.start_count = 0
         self.headers = {
             "Authorization": token,
             "Content-Type": "application/json"
@@ -31,6 +32,7 @@ class DiscordScraper:
         await self.db.async_init()
         await self.db.insert_scraping_account(self.user_id, self.username)
         await self.db.insert_guild("@me", "DMs")
+        self.start_count = await self.db.count_media()
 
     async def get_guilds(self) -> None:
         api_endpoint = self.main_url / "v9/users" / "@me" / "guilds"
@@ -74,6 +76,9 @@ class DiscordScraper:
                             await self.get_guild_channels(guild_id, guild_name)
                         elif response.status == 403:
                             print("Forbidden access to guild:", guild_id, guild_name)
+                            await self.db.remove_guild(guild_id)
+                        elif response.status == 404:
+                            print("Guild not found:", guild_id, guild_name)
                             await self.db.remove_guild(guild_id)
                         else:
                             raise Exception(f"Failed to fetch channels for guild {guild_id}: {response.status}")
@@ -123,7 +128,6 @@ class DiscordScraper:
                         }
 
     async def search_dm_media(self, timestamp: str = None) -> AsyncGenerator[dict, None]:
-        print("Searching media in dms")
         request_json = {
             "include_nsfw": True,
             "tabs": {
@@ -158,7 +162,6 @@ class DiscordScraper:
                         timestamp = media.get("cursor", {}).get("timestamp")
                         yield messages, timestamp
                     else:
-                        print("No more messages found.")
                         break
 
                     if timestamp:
@@ -216,6 +219,11 @@ class DiscordScraper:
                 await self.db.update_guild_timestamp(guild_id, search_timestamp)
                 if guild_id == "@me":
                     await self.db.insert_channel(channel_id, f"{username} DMs", guild_id, False, True)
+
+    async def get_end_count(self):
+        self.end_count = await self.db.count_media()
+        self.new_count = self.end_count - self.start_count
+        return self.new_count
 
     async def close(self):
         if self.session:
@@ -357,6 +365,11 @@ class Database:
         await self.cursor.execute("DELETE FROM guilds WHERE id = ?", (guild_id,))
         await self.connection.commit()
 
+    async def count_media(self):
+        await self.cursor.execute("SELECT COUNT(*) FROM media")
+        count = await self.cursor.fetchone()
+        return count[0] if count else 0
+
     async def close(self):
         if self.connection:
             await self.cursor.close()
@@ -384,6 +397,10 @@ async def main():
     print("Processing DM Media...")
     await scraper.process_dms()
     print("Done!")
+
+    new_count = await scraper.get_end_count()
+    total_count = await scraper.db.count_media()
+    print(f"Found: {new_count} new media items.\nTotal: {total_count} media items.")
 
     await scraper.close()
 
