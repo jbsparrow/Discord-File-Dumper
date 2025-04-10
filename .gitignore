@@ -161,4 +161,4 @@ cython_debug/
 
 
 output.txt
-discord.db
+*.db
