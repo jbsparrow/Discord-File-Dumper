@@ -220,7 +220,7 @@ class DiscordScraper:
                 if guild_id == "@me":
                     await self.db.insert_channel(channel_id, f"{username} DMs", guild_id, False, True)
 
-    async def get_end_count(self):
+    async def get_new_count(self):
         self.end_count = await self.db.count_media()
         self.new_count = self.end_count - self.start_count
         return self.new_count
@@ -398,7 +398,7 @@ async def main():
     await scraper.process_dms()
     print("Done!")
 
-    new_count = await scraper.get_end_count()
+    new_count = await scraper.get_new_count()
     total_count = await scraper.db.count_media()
     print(f"Found: {new_count} new media items.\nTotal: {total_count} media items.")
 
