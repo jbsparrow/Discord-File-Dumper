@@ -11,6 +11,10 @@ from yarl import URL
 
 # Argparse setup
 parser = argparse.ArgumentParser(description="Discord Media Scraper")
+parser.add_argument("--token", type=str, help="Discord token for authentication")
+parser.add_argument("--user-id", type=str, help="Discord user ID for the account")
+parser.add_argument("--username", type=str, help="Discord username for the account")
+parser.add_argument("--db-path", type=str, default="discord.db", help="Path to the SQLite database file")
 parser.add_argument("--deep-scrape", action="store_true", help="Perform a deep scrape of all channels and messages")
 args = parser.parse_args()
 
@@ -33,7 +37,7 @@ class DiscordScraper:
         self.start_count = 0
         self.headers = {"Authorization": token, "Content-Type": "application/json"}
         self.session = None
-        self.db = Database("discord.db")
+        self.db = Database(args.db_path)
         self.request_limiter = AsyncLimiter(5, 2)
 
     async def async_init(self):
@@ -214,7 +218,7 @@ class DiscordScraper:
                     timestamp=timestamp,
                     search_timestamp=search_timestamp,
                 )
-                await self.db.insert_user(user_id, username, None)
+                await self.db.insert_user(user_id, username)
                 await self.db.update_guild_timestamp(guild_id, search_timestamp)
                 if guild_id == "@me":
                     await self.db.insert_channel(channel_id, f"{username} DMs", guild_id, False, True)
@@ -310,10 +314,10 @@ class Database:
         )
         await self.connection.commit()
 
-    async def insert_user(self, user_id: str, username: str, channel_id: str | None):
+    async def insert_user(self, user_id: str, username: str):
         await self.cursor.execute(
             """
-            INSERT OR IGNORE INTO users (id, name) VALUES (?, ?, ?)
+            INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)
             ON CONFLICT(id) DO UPDATE SET name = excluded.name
             """,
             (user_id, username),
@@ -417,18 +421,19 @@ class Database:
             await self.connection.close()
 
 
-# Run the scraper
 async def main():
     dotenv_path = dotenv.find_dotenv()
     dotenv.load_dotenv(dotenv_path)
-    token = str(dotenv.get_key(dotenv_path, "DISCORD_TOKEN"))
-    user_id = str(dotenv.get_key(dotenv_path, "DISCORD_USER_ID"))
-    username = str(dotenv.get_key(dotenv_path, "DISCORD_USERNAME"))
+    token = str(args.token) if args.token else str(dotenv.get_key(dotenv_path, "DISCORD_TOKEN"))
+    user_id = str(args.user_id) if args.user_id else str(dotenv.get_key(dotenv_path, "DISCORD_USER_ID"))
+    username = str(args.username) if args.username else str(dotenv.get_key(dotenv_path, "DISCORD_USERNAME"))
+    if not token or not user_id or not username:
+        log("Missing required arguments: --token, --user-id, --username", logging.ERROR)
+        return
 
     scraper = DiscordScraper(token, user_id, username)
     await scraper.async_init()
 
-    # You can call scraper methods here, e.g.:
     log("Getting Guilds...", logging.INFO)
     await scraper.get_guilds()
     log("Getting Guild Channels...", logging.INFO)

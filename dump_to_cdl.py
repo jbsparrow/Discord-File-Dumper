@@ -1,4 +1,5 @@
 import argparse
+from argparse import BooleanOptionalAction
 import asyncio
 import logging
 from collections.abc import AsyncGenerator
@@ -72,9 +73,10 @@ class Database:
 
 
 class Dumper:
-    def __init__(self, db_path: str, output_file: str, **filters):
-        self.db = Database(db_path)
-        self.output_file = output_file
+    def __init__(self, args: dict, **filters):
+        self.args = args
+        self.db = Database(args.db)
+        self.output_file = args.output
         self.filters = filters
 
     async def run(self):
@@ -83,10 +85,11 @@ class Dumper:
         await self.db.close()
 
     async def check_cdn_expired(self, url: URL | str) -> bool:
-        url = URL(url)
-        expiry = int(url.query.get("ex", 0), 16) * 1000
-        if expiry <= datetime.now().timestamp() * 1000:
-            return str(url.with_host("fixcdn.hyonsu.com"))
+        if self.args.fix_cdn:
+            url = URL(url)
+            expiry = int(url.query.get("ex", 0), 16) * 1000
+            if expiry <= datetime.now().timestamp() * 1000:
+                return str(url.with_host("fixcdn.hyonsu.com"))
         return str(url)
 
     async def dump(self):
@@ -103,12 +106,13 @@ class Dumper:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Dump media URLs grouped by user with optional filters.")
-    parser.add_argument("--db", default="discord.db", help="Path to the SQLite database.")
-    parser.add_argument("--output", default="output.txt", help="Path to the output file.")
+    parser.add_argument("--db", default="discord.db", help="Path to the SQLite database. (default: discord.db)")
+    parser.add_argument("--output", default="output.txt", help="Path to the output file. (default: output.txt)")
     parser.add_argument("--user-id", help="Filter by user ID.")
     parser.add_argument("--guild-id", help="Filter by guild ID.")
     parser.add_argument("--channel-id", help="Filter by channel ID.")
     parser.add_argument("--content-type", help="Filter by content type (e.g., image/png).")
+    parser.add_argument("--fix-cdn", action=BooleanOptionalAction, default=True, help="Fix expired CDN URLs. (default: True)")
 
     dm_group = parser.add_mutually_exclusive_group()
     dm_group.add_argument("--dm", dest="is_dm", action="store_const", const=True, help="Only include DMs.")
@@ -136,7 +140,7 @@ async def main():
         "is_nsfw": args.is_nsfw,
     }
 
-    dumper = Dumper(args.db, args.output, **filters)
+    dumper = Dumper(args, **filters)
 
     if args.user_id:
         query = "SELECT name FROM users WHERE id = ?"
