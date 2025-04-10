@@ -4,6 +4,7 @@ from aiolimiter import AsyncLimiter
 from aiohttp import ClientSession
 from collections.abc import AsyncGenerator
 from yarl import URL
+import dotenv
 import aiosqlite
 from typing import TYPE_CHECKING
 
@@ -93,7 +94,6 @@ class DiscordScraper:
 
         request_url = self.main_url / "v9/guilds" / guild / "messages/search/tabs"
 
-        cnt = 0
         while True:
             async with self.request_limiter:
                 async with self.session.post(request_url, headers=self.headers, json=request_json) as response:
@@ -104,10 +104,51 @@ class DiscordScraper:
                         continue
                     media = data.get("tabs", {}).get("media", {})
                     messages = media.get("messages", [])
-                    # Save response json to folder
-                    with open(f"resps/response{cnt}.json", "w") as f:
-                        json.dump(data, f, indent=4)
-                    cnt += 1
+
+                    if messages:
+                        timestamp = media.get("cursor", {}).get("timestamp")
+                        yield messages, timestamp
+                    else:
+                        print("No more messages found.")
+                        break
+
+                    if timestamp:
+                        request_json["tabs"]["media"]["cursor"] = {
+                            "timestamp": timestamp,
+                            "type": "timestamp"
+                        }
+
+    async def search_dm_media(self, timestamp: str = None) -> AsyncGenerator[dict, None]:
+        print("Searching media in dms")
+        request_json = {
+            "include_nsfw": True,
+            "tabs": {
+                "media": {
+                    "sort_by": "timestamp",
+                    "sort_order": "asc",
+                    "has": ["image", "video"],
+                    "cursor": {
+                        "timestamp": timestamp,
+                        "type": "timestamp"
+                    } if timestamp else None,
+                    "limit": 25,
+                }
+            },
+            "track_exact_total_hits": True,
+        }
+
+        request_url = self.main_url / "v9/users" / "@me" / "messages/search/tabs"
+
+        while True:
+            async with self.request_limiter:
+                async with self.session.post(request_url, headers=self.headers, json=request_json) as response:
+                    data = await response.json()
+                    if "rate limited" in data.get("message", ""):
+                        sleep_time = data.get("retry_after", 0)
+                        await asyncio.sleep(sleep_time * 1.2)
+                        continue
+                    media = data.get("tabs", {}).get("media", {})
+                    messages = media.get("messages", [])
 
                     if messages:
                         timestamp = media.get("cursor", {}).get("timestamp")
@@ -343,10 +384,15 @@ class Database:
 
 # Run the scraper
 async def main():
+    dotenv_path = dotenv.find_dotenv()
+    dotenv.load_dotenv(dotenv_path)
+    token = str(dotenv.get_key(dotenv_path, "DISCORD_TOKEN"))
+    user_id = str(dotenv.get_key(dotenv_path, "DISCORD_USER_ID"))
+    username = str(dotenv.get_key(dotenv_path, "DISCORD_USERNAME"))
     db = Database("discord.db")
     await db.async_init()
 
-    scraper = DiscordScraper("", "", "")
+    scraper = DiscordScraper(token, user_id, username)
     await scraper.async_init()
 
     # You can call scraper methods here, e.g.:
