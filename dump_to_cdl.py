@@ -1,9 +1,28 @@
-import asyncio
 import argparse
+import asyncio
+import logging
 from collections.abc import AsyncGenerator
-from typing import Optional
+
 import aiofiles
 import aiosqlite
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+
+def log(message: str, level: int = logging.INFO):
+    if level == logging.INFO:
+        logger.info(message)
+    elif level == logging.ERROR:
+        logger.error(message)
+    elif level == logging.WARNING:
+        logger.warning(message)
+    elif level == logging.DEBUG:
+        logger.debug(message)
 
 
 class Database:
@@ -23,13 +42,15 @@ class Database:
             async for row in cursor:
                 yield row
 
-    async def get_media_by_user(self,
-                                user_id: str,
-                                guild_id: Optional[str] = None,
-                                channel_id: Optional[str] = None,
-                                content_type: Optional[str] = None,
-                                is_dm: Optional[bool] = None,
-                                is_nsfw: Optional[bool] = None) -> AsyncGenerator:
+    async def get_media_by_user(
+        self,
+        user_id: str,
+        guild_id: str | None = None,
+        channel_id: str | None = None,
+        content_type: str | None = None,
+        is_dm: bool | None = None,
+        is_nsfw: bool | None = None,
+    ) -> AsyncGenerator:
         query = """
             SELECT media.* FROM media
             JOIN channels ON media.channel_id = channels.id
@@ -95,8 +116,12 @@ def parse_args():
     dm_group.add_argument("--no-dm", dest="is_dm", action="store_const", const=False, help="Exclude DMs.")
 
     nsfw_group = parser.add_mutually_exclusive_group()
-    nsfw_group.add_argument("--nsfw", dest="is_nsfw", action="store_const", const=True, help="Only include NSFW content.")
-    nsfw_group.add_argument("--no-nsfw", dest="is_nsfw", action="store_const", const=False, help="Exclude NSFW content.")
+    nsfw_group.add_argument(
+        "--nsfw", dest="is_nsfw", action="store_const", const=True, help="Only include NSFW content."
+    )
+    nsfw_group.add_argument(
+        "--no-nsfw", dest="is_nsfw", action="store_const", const=False, help="Exclude NSFW content."
+    )
 
     return parser.parse_args()
 
@@ -119,11 +144,13 @@ async def main():
         async with dumper.db.conn.execute(query, (args.user_id,)) as cursor:
             row = await cursor.fetchone()
             if row is None:
-                print(f"User ID {args.user_id} not found in the database.")
+                log(f"User ID {args.user_id} not found in the database.", logging.ERROR)
                 return
             username = row[0]
+
         async def patched_get_users():
             yield (args.user_id, username)
+
         dumper.db.get_users = patched_get_users
 
     await dumper.run()
