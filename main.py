@@ -30,6 +30,7 @@ class DiscordScraper:
         self.session = ClientSession()
         await self.db.async_init()
         await self.db.insert_scraping_account(self.user_id, self.username)
+        await self.db.insert_guild("@me", "DMs")
 
     async def get_guilds(self) -> None:
         api_endpoint = self.main_url / "v9/users" / "@me" / "guilds"
@@ -40,7 +41,7 @@ class DiscordScraper:
                     guilds = await response.json()
                     for guild in guilds:
                         await self.db.insert_guild(guild.get("id"), guild.get("name"))
-                        print("Inserted guild:", guild.get("id"), guild.get("name"))
+                        print("Found guild:", guild.get("id"), guild.get("name"))
                 else:
                     raise Exception(f"Failed to fetch guilds: {response.status}")
 
@@ -51,6 +52,7 @@ class DiscordScraper:
             guilds = await self.db.get_guilds()
         async with AsyncLimiter(10):
             for guild in guilds:
+                await asyncio.sleep(0.5)
                 guild_id = guild[0]
                 guild_name = guild[1]
                 print("Getting channels for guild:", guild_id, guild_name)
@@ -112,7 +114,6 @@ class DiscordScraper:
                         timestamp = media.get("cursor", {}).get("timestamp")
                         yield messages, timestamp
                     else:
-                        print("No more messages found.")
                         break
 
                     if timestamp:
@@ -219,6 +220,8 @@ class DiscordScraper:
     async def close(self):
         if self.session:
             await self.session.close()
+        if self.db:
+            await self.db.close()
 
 
 class Database:
@@ -290,8 +293,6 @@ class Database:
         """)
 
         await self.connection.commit()
-        await self.insert_guild("@me", "DMs")
-        await self.connection.commit()
 
     async def insert_guild(self, guild_id: str, name: str):
         await self.cursor.execute("INSERT OR IGNORE INTO guilds (id, name) VALUES (?, ?)", (guild_id, name))
@@ -358,6 +359,7 @@ class Database:
 
     async def close(self):
         if self.connection:
+            await self.cursor.close()
             await self.connection.close()
 
 
@@ -368,8 +370,6 @@ async def main():
     token = str(dotenv.get_key(dotenv_path, "DISCORD_TOKEN"))
     user_id = str(dotenv.get_key(dotenv_path, "DISCORD_USER_ID"))
     username = str(dotenv.get_key(dotenv_path, "DISCORD_USERNAME"))
-    db = Database("discord.db")
-    await db.async_init()
 
     scraper = DiscordScraper(token, user_id, username)
     await scraper.async_init()
@@ -379,16 +379,13 @@ async def main():
     await scraper.get_guilds()
     print("Getting Guild Channels...")
     await scraper.get_guild_channels()
-    print("Processing Messages...")
+    print("Processing Server Media...")
     await scraper.process_guild_messages()
-    print("Processing DMs...")
+    print("Processing DM Media...")
     await scraper.process_dms()
     print("Done!")
 
     await scraper.close()
-    await db.close()
-
-    exit()
 
 
 if __name__ == "__main__":
