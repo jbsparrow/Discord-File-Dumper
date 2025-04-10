@@ -149,7 +149,7 @@ async def main():
             if row is None:
                 log(f"User ID {args.user_id} not found in the database.", logging.ERROR)
                 return
-            username = row[0]
+            username = row[1]
 
         async def patched_get_users():
             yield (args.user_id, username)
