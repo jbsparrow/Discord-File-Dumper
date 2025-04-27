@@ -254,9 +254,11 @@ class Database:
         self.db_path = db_path
         self.connection = None
         self.cursor = None
+        self.lock = asyncio.Lock()
 
     async def async_init(self):
         self.connection = await aiosqlite.connect(self.db_path)
+        await self.connection.execute("PRAGMA journal_mode=WAL;")
         self.cursor = await self.connection.cursor()
         await self.create_tables()
 
@@ -333,46 +335,50 @@ class Database:
         await self.connection.commit()
 
     async def insert_guild(self, guild_id: str, name: str):
-        await self.cursor.execute(
-            """
-            INSERT OR IGNORE INTO guilds (id, name) VALUES (?, ?)
-            ON CONFLICT(id) DO UPDATE SET name = excluded.name
-            """,
-            (guild_id, name),
-        )
-        await self.connection.commit()
+        async with self.lock:
+            await self.cursor.execute(
+                """
+                INSERT OR IGNORE INTO guilds (id, name) VALUES (?, ?)
+                ON CONFLICT(id) DO UPDATE SET name = excluded.name
+                """,
+                (guild_id, name),
+            )
+            await self.connection.commit()
 
     async def insert_user(self, user_id: str, username: str):
-        await self.cursor.execute(
-            """
-            INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)
-            ON CONFLICT(id) DO UPDATE SET name = excluded.name
-            """,
-            (user_id, username),
-        )
-        await self.connection.commit()
+        async with self.lock:
+            await self.cursor.execute(
+                """
+                INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)
+                ON CONFLICT(id) DO UPDATE SET name = excluded.name
+                """,
+                (user_id, username),
+            )
+            await self.connection.commit()
 
     async def insert_channel(
         self, channel_id: str, name: str, guild_id: str, is_nsfw: bool = False, is_dm: bool = False
     ):
-        await self.cursor.execute(
-            """
-            INSERT OR IGNORE INTO channels (id, name, is_dm, is_nsfw, guild_id) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET name = excluded.name, is_dm = excluded.is_dm, is_nsfw = excluded.is_nsfw
-            """,
-            (channel_id, name, is_dm, is_nsfw, guild_id),
-        )
-        await self.connection.commit()
+        async with self.lock:
+            await self.cursor.execute(
+                """
+                INSERT OR IGNORE INTO channels (id, name, is_dm, is_nsfw, guild_id) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET name = excluded.name, is_dm = excluded.is_dm, is_nsfw = excluded.is_nsfw
+                """,
+                (channel_id, name, is_dm, is_nsfw, guild_id),
+            )
+            await self.connection.commit()
 
     async def insert_scraping_account(self, user_id: str, username: str, token: str):
-        await self.cursor.execute(
-            """
-            INSERT OR IGNORE INTO accounts (id, name, token) VALUES (?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET name = excluded.name, token = excluded.token
-            """,
-            (user_id, username, token),
-        )
-        await self.connection.commit()
+        async with self.lock:
+            await self.cursor.execute(
+                """
+                INSERT OR IGNORE INTO accounts (id, name, token) VALUES (?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET name = excluded.name, token = excluded.token
+                """,
+                (user_id, username, token),
+            )
+            await self.connection.commit()
 
     async def insert_message(
         self,
@@ -387,15 +393,27 @@ class Database:
         search_timestamp: str,
         has_media: bool = False,
     ):
-        await self.cursor.execute(
-            """
-            INSERT INTO messages (id, content, timestamp, edited_timestamp, user_id, guild_id, channel_id, account_id, search_timestamp, has_media)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET content = excluded.content, has_media = excluded.has_media
-        """,
-            (message_id, content, timestamp, edited_timestamp, user_id, guild_id, channel_id, account_id, search_timestamp, has_media),
-        )
-        await self.connection.commit()
+        async with self.lock:
+            await self.cursor.execute(
+                """
+                INSERT INTO messages (id, content, timestamp, edited_timestamp, user_id, guild_id, channel_id, account_id, search_timestamp, has_media)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET content = excluded.content, has_media = excluded.has_media
+            """,
+                (
+                    message_id,
+                    content,
+                    timestamp,
+                    edited_timestamp,
+                    user_id,
+                    guild_id,
+                    channel_id,
+                    account_id,
+                    search_timestamp,
+                    has_media,
+                ),
+            )
+            await self.connection.commit()
 
     async def insert_media(
         self,
@@ -409,22 +427,28 @@ class Database:
         message_id: str,
         search_timestamp: str,
     ):
-        await self.cursor.execute(
-            """
-            INSERT INTO media (file_id, url, filename, size, content_type, width, height, message_id, search_timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(file_id) DO UPDATE SET url = excluded.url
-        """,
-            (file_id, url, filename, size, content_type, width, height, message_id, search_timestamp),
-        )
-        await self.connection.commit()
+        async with self.lock:
+            await self.cursor.execute(
+                """
+                INSERT INTO media (file_id, url, filename, size, content_type, width, height, message_id, search_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_id) DO UPDATE SET url = excluded.url
+            """,
+                (file_id, url, filename, size, content_type, width, height, message_id, search_timestamp),
+            )
+            await self.connection.commit()
 
     async def update_guild_timestamp(self, guild_id: str, timestamp: str, type: int):
-        if type == 0: # Media timestamp
-            await self.cursor.execute("UPDATE guilds SET last_media_timestamp = ? WHERE id = ?", (timestamp, guild_id))
-        else: # Message timestamp
-            await self.cursor.execute("UPDATE guilds SET last_message_timestamp = ? WHERE id = ?", (timestamp, guild_id))
-        await self.connection.commit()
+        async with self.lock:
+            if type == 0:  # Media timestamp
+                await self.cursor.execute(
+                    "UPDATE guilds SET last_media_timestamp = ? WHERE id = ?", (timestamp, guild_id)
+                )
+            else:  # Message timestamp
+                await self.cursor.execute(
+                    "UPDATE guilds SET last_message_timestamp = ? WHERE id = ?", (timestamp, guild_id)
+                )
+            await self.connection.commit()
 
     async def get_guilds(self, get_dms: bool = False) -> list[tuple[str, str]]:
         if get_dms:
@@ -432,7 +456,36 @@ class Database:
             return await self.cursor.fetchone()
         await self.cursor.execute("SELECT * FROM guilds")
         guilds = await self.cursor.fetchall()
-        guilds2 = [guild for guild in guilds if guild[0] in ("828457542984269824", "868647576147214346", "946184119681974312", "981383507240714251", "987930226510164048", "1008185503675322438", "1010957855781826581", "1014622053447503963", "1044790295709110302", "1048365633370333257", "1074390145949773935", "1075901389483560970", "1082723000018817084", "1092654605508296796", "1101492300569391155", "1106578934096723989", "1122129950829453394", "1191181354176622643", "1214770852445294675", "1267923275523031181", "1284154644972441672", "1323109688098820116", "1331814509534249051")]
+        guilds2 = [
+            guild
+            for guild in guilds
+            if guild[0]
+            in (
+                "828457542984269824",
+                "868647576147214346",
+                "946184119681974312",
+                "981383507240714251",
+                "987930226510164048",
+                "1008185503675322438",
+                "1010957855781826581",
+                "1014622053447503963",
+                "1044790295709110302",
+                "1048365633370333257",
+                "1074390145949773935",
+                "1075901389483560970",
+                "1082723000018817084",
+                "1092654605508296796",
+                "1101492300569391155",
+                "1106578934096723989",
+                "1122129950829453394",
+                "1191181354176622643",
+                "1214770852445294675",
+                "1267923275523031181",
+                "1284154644972441672",
+                "1323109688098820116",
+                "1331814509534249051",
+            )
+        ]
         return [guild for guild in guilds2 if guild[0] not in ("@me",)]
 
     async def get_channels(self, guild_id: str | None, is_nsfw: bool = False):
@@ -443,8 +496,9 @@ class Database:
         return await self.cursor.fetchall()
 
     async def remove_guild(self, guild_id: str):
-        await self.cursor.execute("DELETE FROM guilds WHERE id = ?", (guild_id,))
-        await self.connection.commit()
+        async with self.lock:
+            await self.cursor.execute("DELETE FROM guilds WHERE id = ?", (guild_id,))
+            await self.connection.commit()
 
     async def count_media(self):
         await self.cursor.execute("SELECT COUNT(*) FROM media")
