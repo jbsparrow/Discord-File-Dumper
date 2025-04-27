@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import signal
 from collections.abc import AsyncGenerator
 
 import aiosqlite
@@ -212,7 +213,7 @@ class DiscordScraper:
             search_timestamp=search_timestamp,
             has_media=has_media,
         )
-        await self.db.insert_user(user_id, username)
+        await self.db.insert_user(user_id, username, channel_id if guild_id == "@me" else None)
         await self.db.update_guild_timestamp(guild_id, search_timestamp, 1 if args.store_messages else 0)
         if guild_id == "@me":
             await self.db.insert_channel(channel_id, user_id, guild_id, False, True)
@@ -274,7 +275,8 @@ class Database:
         await self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
-                name TEXT
+                name TEXT,
+                channel_id TEXT
             )
         """)
 
@@ -345,14 +347,14 @@ class Database:
             )
             await self.connection.commit()
 
-    async def insert_user(self, user_id: str, username: str):
+    async def insert_user(self, user_id: str, username: str, channel_id: str | None = None):
         async with self.lock:
             await self.cursor.execute(
                 """
-                INSERT OR IGNORE INTO users (id, name) VALUES (?, ?)
-                ON CONFLICT(id) DO UPDATE SET name = excluded.name
+                INSERT OR IGNORE INTO users (id, name, channel_id) VALUES (?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET name = excluded.name, channel_id = excluded.channel_id
                 """,
-                (user_id, username),
+                (user_id, username, channel_id),
             )
             await self.connection.commit()
 
@@ -512,34 +514,56 @@ class Database:
 
 
 async def main():
-    dotenv_path = dotenv.find_dotenv()
-    dotenv.load_dotenv(dotenv_path)
-    token = str(args.token) if args.token else str(dotenv.get_key(dotenv_path, "DISCORD_TOKEN"))
-    user_id = str(args.user_id) if args.user_id else str(dotenv.get_key(dotenv_path, "DISCORD_USER_ID"))
-    username = str(args.username) if args.username else str(dotenv.get_key(dotenv_path, "DISCORD_USERNAME"))
-    if not token or not user_id or not username:
-        log("Missing required arguments: --token, --user-id, --username", logging.ERROR)
-        return
+    try:
+        dotenv_path = dotenv.find_dotenv()
+        dotenv.load_dotenv(dotenv_path)
+        token = str(args.token) if args.token else str(dotenv.get_key(dotenv_path, "DISCORD_TOKEN"))
+        user_id = str(args.user_id) if args.user_id else str(dotenv.get_key(dotenv_path, "DISCORD_USER_ID"))
+        username = str(args.username) if args.username else str(dotenv.get_key(dotenv_path, "DISCORD_USERNAME"))
+        if not token or not user_id or not username:
+            log("Missing required arguments: --token, --user-id, --username", logging.ERROR)
+            return
 
-    scraper = DiscordScraper(token, user_id, username)
-    await scraper.async_init()
+        scraper = DiscordScraper(token, user_id, username)
+        await scraper.async_init()
 
-    log("Getting Guilds...", logging.INFO)
-    await scraper.get_guilds()
-    log("Getting Guild Channels...", logging.INFO)
-    # await scraper.get_guild_channels(None, None)
-    log("Processing Server Media...", logging.INFO)
-    # await scraper.process_guild_messages()
-    log("Processing DM Media...", logging.INFO)
-    await scraper.process_dms()
-    log("Done!", logging.INFO)
+        log("Getting Guilds...", logging.INFO)
+        await scraper.get_guilds()
+        log("Getting Guild Channels...", logging.INFO)
+        # await scraper.get_guild_channels(None, None)
+        log("Processing Server Media...", logging.INFO)
+        # await scraper.process_guild_messages()
+        log("Processing DM Media...", logging.INFO)
+        await scraper.process_dms()
+        log("Done!", logging.INFO)
 
-    new_count = await scraper.get_new_count()
-    total_count = await scraper.db.count_media()
-    log(f"Found: {new_count} new media items.\nTotal: {total_count} media items.", logging.INFO)
+    except asyncio.CancelledError:
+        log("Main task cancelled. Performing cleanup...", logging.WARNING)
 
-    await scraper.close()
+    finally:
+        if "scraper" in locals():
+            new_count = await scraper.get_new_count()
+            total_count = await scraper.db.count_media()
+            log(f"Found: {new_count} new media items.\nTotal: {total_count} media items.", logging.INFO)
+
+            await scraper.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+
+    async def shutdown(signal_received, loop):
+        print(f"\n[!] Received exit signal {signal_received.name}, shutting down...")
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        loop.stop()
+
+    for s in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(s, lambda s=s: asyncio.create_task(shutdown(s, loop)))
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
