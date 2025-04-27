@@ -235,6 +235,10 @@ class DiscordScraper:
                     width=width,
                     height=height,
                     message_id=message_id,
+                    user_id=user_id,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    account_id=self.user_id,
                     search_timestamp=search_timestamp,
                 )
 
@@ -329,8 +333,16 @@ class Database:
                 width INTEGER,
                 height INTEGER,
                 message_id TEXT,
+                user_id TEXT,
+                guild_id TEXT,
+                channel_id TEXT,
+                account_id TEXT,
                 search_timestamp TEXT,
-                FOREIGN KEY (message_id) REFERENCES messages(id)
+                FOREIGN KEY (message_id) REFERENCES messages(id),
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (guild_id) REFERENCES guilds(id),
+                FOREIGN KEY (channel_id) REFERENCES channels(id),
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
             )
         """)
 
@@ -427,16 +439,20 @@ class Database:
         width: int,
         height: int,
         message_id: str,
+        user_id: str,
+        guild_id: str,
+        channel_id: str,
+        account_id: str,
         search_timestamp: str,
     ):
         async with self.lock:
             await self.cursor.execute(
                 """
-                INSERT INTO media (file_id, url, filename, size, content_type, width, height, message_id, search_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO media (file_id, url, filename, size, content_type, width, height, message_id, user_id, guild_id, channel_id, account_id, search_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(file_id) DO UPDATE SET url = excluded.url
             """,
-                (file_id, url, filename, size, content_type, width, height, message_id, search_timestamp),
+                (file_id, url, filename, size, content_type, width, height, message_id, user_id, guild_id, channel_id, account_id, search_timestamp),
             )
             await self.connection.commit()
 
@@ -530,7 +546,7 @@ async def main():
         log("Getting Guilds...", logging.INFO)
         await scraper.get_guilds()
         log("Getting Guild Channels...", logging.INFO)
-        await scraper.get_guild_channels(None, None)
+        # await scraper.get_guild_channels(None, None)
         log("Processing Server Media...", logging.INFO)
         # await scraper.process_guild_messages()
         log("Processing DM Media...", logging.INFO)
