@@ -530,7 +530,7 @@ async def main():
         log("Getting Guilds...", logging.INFO)
         await scraper.get_guilds()
         log("Getting Guild Channels...", logging.INFO)
-        # await scraper.get_guild_channels(None, None)
+        await scraper.get_guild_channels(None, None)
         log("Processing Server Media...", logging.INFO)
         # await scraper.process_guild_messages()
         log("Processing DM Media...", logging.INFO)

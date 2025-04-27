@@ -46,16 +46,17 @@ class Database:
     ):
         query = """
             SELECT media.* FROM media
-            JOIN channels ON media.channel_id = channels.id
-            WHERE media.user_id = ?
+            JOIN messages ON media.message_id = messages.id
+            JOIN channels ON messages.channel_id = channels.id
+            WHERE messages.user_id = ?
         """
         params = [user_id]
 
         if guild_id:
-            query += " AND media.guild_id = ?"
+            query += " AND messages.guild_id = ?"
             params.append(guild_id)
         if channel_id:
-            query += " AND media.channel_id = ?"
+            query += " AND messages.channel_id = ?"
             params.append(channel_id)
         if content_type:
             query += " AND media.content_type = ?"
