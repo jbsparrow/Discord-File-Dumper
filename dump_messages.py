@@ -14,9 +14,11 @@ parser = argparse.ArgumentParser(description="Discord Media Scraper")
 parser.add_argument("--token", type=str, help="Discord token for authentication")
 parser.add_argument("--user-id", type=str, help="Discord user ID for the account")
 parser.add_argument("--username", type=str, help="Discord username for the account")
-parser.add_argument("--db-path", type=str, default="discord.db", help="Path to the SQLite database file")
+parser.add_argument("--db-path", type=str, default="messages.db", help="Path to the SQLite database file")
 parser.add_argument("--deep-scrape", action="store_true", help="Perform a deep scrape of all channels and messages")
+parser.add_argument("--store-messages", action="store_true", help="Scrape messages from all channels")
 args = parser.parse_args()
+args.store_messages = True
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -104,7 +106,6 @@ class DiscordScraper:
                 "media": {
                     "sort_by": "timestamp",
                     "sort_order": "asc",
-                    "has": ["image", "video", "file"],
                     "cursor": {"timestamp": timestamp, "type": "timestamp"} if timestamp else None,
                     "limit": 25,
                 }
@@ -141,7 +142,6 @@ class DiscordScraper:
                 "media": {
                     "sort_by": "timestamp",
                     "sort_order": "asc",
-                    "has": ["image", "video", "file"],
                     "cursor": {"timestamp": timestamp, "type": "timestamp"} if timestamp else None,
                     "limit": 25,
                 }
@@ -183,14 +183,40 @@ class DiscordScraper:
 
     async def process_dms(self):
         guild = await self.db.get_guilds(get_dms=True)
-        last_timestamp = guild[2] if not args.deep_scrape else None
+        last_timestamp = guild[3] if args.store_messages else guild[2]
+        last_timestamp = None if args.deep_scrape else last_timestamp
         async for messages, search_timestamp in self.search_dm_media(last_timestamp):
             for message in messages:
                 message = message[0]
                 await self.process_message(message, "@me", search_timestamp)
 
     async def process_message(self, message, guild_id: str, search_timestamp: str):
-        for attachment in message.get("attachments", []):
+        message_id = message.get("id", 0)
+        content = message.get("content", "")
+        channel_id = message.get("channel_id", 0)
+        user_id = message.get("author", {}).get("id", 0)
+        username = message.get("author", {}).get("username", "")
+        timestamp = message.get("timestamp", "")
+        edited_timestamp = message.get("edited_timestamp", "")
+        attachments = message.get("attachments", [])
+        has_media = bool(attachments)
+        await self.db.insert_message(
+            message_id=message_id,
+            content=content,
+            timestamp=timestamp,
+            edited_timestamp=edited_timestamp,
+            user_id=user_id,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            account_id=self.user_id,
+            search_timestamp=search_timestamp,
+            has_media=has_media,
+        )
+        await self.db.insert_user(user_id, username)
+        await self.db.update_guild_timestamp(guild_id, search_timestamp, 1 if args.store_messages else 0)
+        if guild_id == "@me":
+            await self.db.insert_channel(channel_id, user_id, guild_id, False, True)
+        for attachment in attachments:
             file_id = attachment.get("id", 0)
             url = attachment.get("url")
             filename = attachment.get("filename")
@@ -198,10 +224,6 @@ class DiscordScraper:
             content_type = attachment.get("content_type")
             width = attachment.get("width", 0)
             height = attachment.get("height", 0)
-            user_id = message.get("author", {}).get("id")
-            username = message.get("author", {}).get("username")
-            channel_id = message.get("channel_id")
-            timestamp = message.get("timestamp")
             if url:
                 await self.db.insert_media(
                     file_id=file_id,
@@ -211,17 +233,9 @@ class DiscordScraper:
                     content_type=content_type,
                     width=width,
                     height=height,
-                    user_id=user_id,
-                    guild_id=guild_id,
-                    channel_id=channel_id,
-                    account_id=self.user_id,
-                    timestamp=timestamp,
+                    message_id=message_id,
                     search_timestamp=search_timestamp,
                 )
-                await self.db.insert_user(user_id, username)
-                await self.db.update_guild_timestamp(guild_id, search_timestamp)
-                if guild_id == "@me":
-                    await self.db.insert_channel(channel_id, f"{username} DMs", guild_id, False, True)
 
     async def get_new_count(self):
         self.end_count = await self.db.count_media()
@@ -266,7 +280,8 @@ class Database:
             CREATE TABLE IF NOT EXISTS guilds (
                 id TEXT PRIMARY KEY,
                 name TEXT,
-                last_timestamp TEXT
+                last_media_timestamp TEXT,
+                last_message_timestamp TEXT
             )
         """)
 
@@ -282,6 +297,25 @@ class Database:
         """)
 
         await self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                content TEXT,
+                timestamp TEXT,
+                edited_timestamp TEXT,
+                user_id TEXT,
+                guild_id TEXT,
+                channel_id TEXT,
+                account_id TEXT,
+                search_timestamp TEXT,
+                has_media INTEGER,
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (guild_id) REFERENCES guilds(id),
+                FOREIGN KEY (channel_id) REFERENCES channels(id),
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            )
+        """)
+
+        await self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS media (
                 file_id TEXT PRIMARY KEY,
                 url TEXT,
@@ -290,16 +324,9 @@ class Database:
                 content_type TEXT,
                 width INTEGER,
                 height INTEGER,
-                user_id TEXT,
-                guild_id TEXT,
-                channel_id TEXT,
-                account_id TEXT,
-                timestamp TEXT,
+                message_id TEXT,
                 search_timestamp TEXT,
-                FOREIGN KEY (user_id) REFERENCES users(id),
-                FOREIGN KEY (guild_id) REFERENCES guilds(id),
-                FOREIGN KEY (channel_id) REFERENCES channels(id),
-                FOREIGN KEY (account_id) REFERENCES accounts(id)
+                FOREIGN KEY (message_id) REFERENCES messages(id)
             )
         """)
 
@@ -347,6 +374,29 @@ class Database:
         )
         await self.connection.commit()
 
+    async def insert_message(
+        self,
+        message_id: str,
+        content: str,
+        timestamp: str,
+        edited_timestamp: str,
+        user_id: str,
+        guild_id: str,
+        channel_id: str,
+        account_id: str,
+        search_timestamp: str,
+        has_media: bool = False,
+    ):
+        await self.cursor.execute(
+            """
+            INSERT INTO messages (id, content, timestamp, edited_timestamp, user_id, guild_id, channel_id, account_id, search_timestamp, has_media)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET content = excluded.content, has_media = excluded.has_media
+        """,
+            (message_id, content, timestamp, edited_timestamp, user_id, guild_id, channel_id, account_id, search_timestamp, has_media),
+        )
+        await self.connection.commit()
+
     async def insert_media(
         self,
         file_id: str,
@@ -356,40 +406,24 @@ class Database:
         content_type: str,
         width: int,
         height: int,
-        user_id: str,
-        guild_id: str,
-        channel_id: str,
-        account_id: str,
-        timestamp: str,
+        message_id: str,
         search_timestamp: str,
     ):
         await self.cursor.execute(
             """
-            INSERT INTO media (file_id, url, filename, size, content_type, width, height, user_id, guild_id,
-                                        channel_id, account_id, timestamp, search_timestamp)
-            VALUES (?,?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(file_id) DO UPDATE SET url=excluded.url
+            INSERT INTO media (file_id, url, filename, size, content_type, width, height, message_id, search_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(file_id) DO UPDATE SET url = excluded.url
         """,
-            (
-                file_id,
-                url,
-                filename,
-                size,
-                content_type,
-                width,
-                height,
-                user_id,
-                guild_id,
-                channel_id,
-                account_id,
-                timestamp,
-                search_timestamp,
-            ),
+            (file_id, url, filename, size, content_type, width, height, message_id, search_timestamp),
         )
         await self.connection.commit()
 
-    async def update_guild_timestamp(self, guild_id: str, timestamp: str):
-        await self.cursor.execute("UPDATE guilds SET last_timestamp = ? WHERE id = ?", (timestamp, guild_id))
+    async def update_guild_timestamp(self, guild_id: str, timestamp: str, type: int):
+        if type == 0: # Media timestamp
+            await self.cursor.execute("UPDATE guilds SET last_media_timestamp = ? WHERE id = ?", (timestamp, guild_id))
+        else: # Message timestamp
+            await self.cursor.execute("UPDATE guilds SET last_message_timestamp = ? WHERE id = ?", (timestamp, guild_id))
         await self.connection.commit()
 
     async def get_guilds(self, get_dms: bool = False) -> list[tuple[str, str]]:
@@ -438,10 +472,10 @@ async def main():
 
     log("Getting Guilds...", logging.INFO)
     await scraper.get_guilds()
-    # log("Getting Guild Channels...", logging.INFO)
+    log("Getting Guild Channels...", logging.INFO)
     # await scraper.get_guild_channels(None, None)
     log("Processing Server Media...", logging.INFO)
-    await scraper.process_guild_messages()
+    # await scraper.process_guild_messages()
     log("Processing DM Media...", logging.INFO)
     await scraper.process_dms()
     log("Done!", logging.INFO)

@@ -87,8 +87,10 @@ class Dumper:
         self.output_file = args.output
         self.filters = filters
 
-    async def run(self):
+    async def async_init_db(self):
         await self.db.async_init()
+
+    async def run(self):
         await self.dump()
         await self.db.close()
 
@@ -148,6 +150,7 @@ async def main():
     }
 
     dumper = Dumper(args, **filters)
+    await dumper.async_init_db()
 
     if args.user_id:
         query = "SELECT name FROM users WHERE id = ?"
@@ -156,7 +159,7 @@ async def main():
             if row is None:
                 log(f"User ID {args.user_id} not found in the database.", logging.ERROR)
                 return
-            username = row[1]
+            username = row[0]
 
         async def patched_get_users():
             yield (args.user_id, username)
